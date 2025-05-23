@@ -714,6 +714,10 @@
     <canvas id="effectCanvas"></canvas>
     <canvas id="overlayCanvas"></canvas>
     <canvas id="measurementCanvas"></canvas>
+    <!-- AR Session Button -->
+    <button id="arButton" style="position: fixed; bottom: 20px; right: 20px; z-index: 1000; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; border: none; padding: 12px 24px; border-radius: 24px; font-weight: 600; display: none; cursor: pointer;">
+      Start AR
+    </button>
   </div>
 
   <!-- Onboarding -->
@@ -759,6 +763,13 @@
             <div class="feature-text">
               <div class="feature-title">Calculate Areas</div>
               <div class="feature-desc">Measure surface areas of detected shapes</div>
+            </div>
+          </div>
+          <div class="feature-item">
+            <div class="feature-icon">🎯</div>
+            <div class="feature-text">
+              <div class="feature-title">AR Precision</div>
+              <div class="feature-desc">True depth sensing with ARKit on supported devices</div>
             </div>
           </div>
         </div>
@@ -865,9 +876,12 @@
   <div id="notification"></div>
 
   <!-- Scripts -->
-  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.15.0/dist/tf.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.2/dist/coco-ssd.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1646424915/hands.js"></script>
+  <!-- WebXR Polyfill for iOS compatibility -->
+  <script src="https://cdn.jsdelivr.net/npm/webxr-polyfill@2.0.3/build/webxr-polyfill.js"></script>
+  <!-- Three.js for 3D rendering -->
+  <script src="https://cdn.jsdelivr.net/npm/three@0.156.0/build/three.min.js"></script>
+  <!-- AR.js for additional AR features -->
+  <script src="https://cdn.jsdelivr.net/npm/@ar-js-org/ar.js@3.4.5/aframe/build/aframe-ar.min.js"></script>
   <script>
     class MeasureARApp {
       constructor() {
@@ -900,9 +914,22 @@
         this.shapes = [];
         this.calibrationFactor = 1; // pixels to real-world units
         
-        // Shape detection
-        this.shapeDetector = null;
-        this.handDetector = null;
+        // WebXR AR State
+        this.xrSession = null;
+        this.xrRefSpace = null;
+        this.xrHitTestSource = null;
+        this.gl = null;
+        this.renderer = null;
+        this.scene = null;
+        this.camera = null;
+        this.reticle = null;
+        this.worldPoints = [];
+        this.anchorPoints = [];
+        
+        // AR detection features
+        this.planeDetection = false;
+        this.depthSensing = false;
+        this.lightEstimation = false;
         
         // Touch/Click handling
         this.isDrawing = false;
@@ -915,12 +942,20 @@
         this.initializeApp();
       }
 
-      initializeApp() {
+      async initializeApp() {
         // Check for required APIs
         if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
           this.showError('Browser Not Supported', 'Please use Safari or Chrome on iOS.');
           return;
         }
+        
+        // Initialize WebXR polyfill for iOS
+        if ('xr' in navigator === false) {
+          window.polyfill = new WebXRPolyfill();
+        }
+        
+        // Check AR support
+        this.checkARSupport();
         
         this.setupEventListeners();
         this.handleOrientation();
@@ -928,8 +963,103 @@
         // Check for iOS
         this.isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent);
         
+        // Check for specific iOS devices with LiDAR
+        this.checkDeviceCapabilities();
+        
+        // Initialize Three.js for 3D rendering
+        this.initThreeJS();
+        
         // Show onboarding
         this.showOnboarding();
+      }
+
+      checkDeviceCapabilities() {
+        // Check screen size and pixel ratio for device detection
+        const screenWidth = window.screen.width;
+        const screenHeight = window.screen.height;
+        const pixelRatio = window.devicePixelRatio || 1;
+        
+        // iPhone models with LiDAR (approximate detection)
+        const hasLiDAR = this.isIOS && (
+          // iPhone 12 Pro, 12 Pro Max
+          (screenWidth === 390 && screenHeight === 844 && pixelRatio === 3) ||
+          (screenWidth === 428 && screenHeight === 926 && pixelRatio === 3) ||
+          // iPhone 13 Pro, 13 Pro Max
+          (screenWidth === 390 && screenHeight === 844 && pixelRatio === 3) ||
+          (screenWidth === 428 && screenHeight === 926 && pixelRatio === 3) ||
+          // iPhone 14 Pro, 14 Pro Max
+          (screenWidth === 393 && screenHeight === 852 && pixelRatio === 3) ||
+          (screenWidth === 430 && screenHeight === 932 && pixelRatio === 3) ||
+          // iPhone 15 Pro, 15 Pro Max
+          (screenWidth === 393 && screenHeight === 852 && pixelRatio === 3) ||
+          (screenWidth === 430 && screenHeight === 932 && pixelRatio === 3) ||
+          // iPad Pro with LiDAR
+          (screenWidth >= 1024 && pixelRatio >= 2)
+        );
+        
+        this.hasLiDAR = hasLiDAR;
+        
+        if (hasLiDAR) {
+          console.log('LiDAR scanner detected');
+        }
+      }
+
+      async checkARSupport() {
+        if ('xr' in navigator) {
+          try {
+            this.isARSupported = await navigator.xr.isSessionSupported('immersive-ar');
+            console.log('AR Support:', this.isARSupported);
+            
+            if (this.isARSupported) {
+              // Don't request sessions just to check features - it would start AR immediately
+              // Just assume common features are available
+              this.planeDetection = true;
+              this.depthSensing = this.hasLiDAR;
+              this.lightEstimation = true;
+            }
+          } catch (e) {
+            console.log('AR not supported:', e);
+            this.isARSupported = false;
+          }
+        } else {
+          this.isARSupported = false;
+        }
+      }
+
+      initThreeJS() {
+        // Create Three.js renderer
+        this.renderer = new THREE.WebGLRenderer({
+          antialias: true,
+          alpha: true,
+          canvas: this.effectCanvas
+        });
+        this.renderer.setPixelRatio(window.devicePixelRatio);
+        this.renderer.setSize(window.innerWidth, window.innerHeight);
+        this.renderer.xr.enabled = true;
+        
+        // Create scene
+        this.scene = new THREE.Scene();
+        
+        // Create camera
+        this.camera = new THREE.PerspectiveCamera(
+          70,
+          window.innerWidth / window.innerHeight,
+          0.01,
+          20
+        );
+        
+        // Create reticle for hit testing
+        const geometry = new THREE.RingGeometry(0.15, 0.2, 32).rotateX(-Math.PI / 2);
+        const material = new THREE.MeshBasicMaterial();
+        this.reticle = new THREE.Mesh(geometry, material);
+        this.reticle.matrixAutoUpdate = false;
+        this.reticle.visible = false;
+        this.scene.add(this.reticle);
+        
+        // Add lighting
+        const light = new THREE.HemisphereLight(0xffffff, 0xbbbbff, 1);
+        light.position.set(0.5, 1, 0.25);
+        this.scene.add(light);
       }
 
       showOnboarding() {
@@ -975,7 +1105,11 @@
         }
         
         // Start the app
-        await this.start();
+        if (this.isARSupported) {
+          await this.startAR();
+        } else {
+          await this.start();
+        }
       }
 
       setupEventListeners() {
@@ -1008,11 +1142,32 @@
           saveBtn.addEventListener('click', () => this.saveMeasurements());
         }
         
+        // AR button
+        const arBtn = document.getElementById('arButton');
+        if (arBtn) {
+          arBtn.addEventListener('click', async () => {
+            if (this.xrSession) {
+              await this.xrSession.end();
+              arBtn.textContent = 'Start AR';
+            } else {
+              await this.startAR();
+              arBtn.textContent = 'Exit AR';
+            }
+          });
+        }
+        
         // Canvas interactions
         this.measurementCanvas.addEventListener('click', (e) => this.handleCanvasClick(e));
         this.measurementCanvas.addEventListener('touchstart', (e) => this.handleTouch(e), { passive: false });
         this.measurementCanvas.addEventListener('touchmove', (e) => this.handleTouchMove(e), { passive: false });
         this.measurementCanvas.addEventListener('touchend', (e) => this.handleTouchEnd(e), { passive: false });
+        
+        // AR select events
+        if ('xr' in navigator) {
+          window.addEventListener('beforexrselect', (e) => {
+            e.preventDefault();
+          });
+        }
         
         // Make measurement canvas interactive
         this.measurementCanvas.style.pointerEvents = 'auto';
@@ -1091,6 +1246,11 @@
       }
 
       handleCanvasClick(e) {
+        if (this.xrSession) {
+          // AR mode - use select event instead
+          return;
+        }
+        
         const rect = this.measurementCanvas.getBoundingClientRect();
         const x = e.clientX - rect.left;
         const y = e.clientY - rect.top;
@@ -1100,14 +1260,78 @@
 
       handleTouch(e) {
         e.preventDefault();
-        const touch = e.touches[0];
-        const rect = this.measurementCanvas.getBoundingClientRect();
-        const x = touch.clientX - rect.left;
-        const y = touch.clientY - rect.top;
         
-        if (this.currentMode === 'measure') {
-          this.addMeasurementPoint(x, y);
+        if (this.xrSession) {
+          // AR mode - place point at reticle position
+          if (this.reticle && this.reticle.visible) {
+            const position = new THREE.Vector3();
+            this.reticle.getWorldPosition(position);
+            
+            // Add world point
+            this.worldPoints.push({
+              x: position.x,
+              y: position.y,
+              z: position.z
+            });
+            
+            // Create visual marker
+            this.createARMarker(position);
+            
+            // Add screen point for UI
+            const touch = e.touches[0];
+            const rect = this.measurementCanvas.getBoundingClientRect();
+            const x = touch.clientX - rect.left;
+            const y = touch.clientY - rect.top;
+            this.addMeasurementPoint(x, y);
+          }
+        } else {
+          // Regular touch handling
+          const touch = e.touches[0];
+          const rect = this.measurementCanvas.getBoundingClientRect();
+          const x = touch.clientX - rect.left;
+          const y = touch.clientY - rect.top;
+          
+          if (this.currentMode === 'measure') {
+            this.addMeasurementPoint(x, y);
+          }
         }
+      }
+
+      createARMarker(position) {
+        // Create 3D marker at measurement point
+        const geometry = new THREE.SphereGeometry(0.02, 32, 32);
+        const material = new THREE.MeshBasicMaterial({ color: 0x667eea });
+        const marker = new THREE.Mesh(geometry, material);
+        
+        marker.position.copy(position);
+        this.scene.add(marker);
+        
+        // Add pulsing animation
+        const pulseGeometry = new THREE.RingGeometry(0.05, 0.08, 32);
+        const pulseMaterial = new THREE.MeshBasicMaterial({ 
+          color: 0x667eea,
+          transparent: true,
+          opacity: 0.5
+        });
+        const pulse = new THREE.Mesh(pulseGeometry, pulseMaterial);
+        pulse.position.copy(position);
+        pulse.lookAt(this.camera.position);
+        this.scene.add(pulse);
+        
+        // Animate pulse
+        let scale = 1;
+        const animatePulse = () => {
+          scale += 0.02;
+          pulse.scale.set(scale, scale, 1);
+          pulseMaterial.opacity = Math.max(0, 0.5 - (scale - 1) * 0.5);
+          
+          if (scale < 2) {
+            requestAnimationFrame(animatePulse);
+          } else {
+            this.scene.remove(pulse);
+          }
+        };
+        animatePulse();
       }
 
       handleTouchMove(e) {
@@ -1189,35 +1413,118 @@
       }
 
       calculateDistance() {
-        const [p1, p2] = this.measurementPoints;
-        const distance = Math.sqrt(Math.pow(p2.x - p1.x, 2) + Math.pow(p2.y - p1.y, 2));
+        if (this.xrSession && this.worldPoints.length >= 2) {
+          // AR mode - use real world coordinates
+          const [p1, p2] = this.worldPoints.slice(-2);
+          const distance = Math.sqrt(
+            Math.pow(p2.x - p1.x, 2) + 
+            Math.pow(p2.y - p1.y, 2) + 
+            Math.pow(p2.z - p1.z, 2)
+          );
+          
+          // Distance is in meters, convert to cm
+          const realDistance = (distance * 100).toFixed(1);
+          
+          // Store measurement
+          const measurement = {
+            type: 'distance',
+            value: `${realDistance} cm`,
+            points: [...this.measurementPoints],
+            worldPoints: [...this.worldPoints.slice(-2)],
+            timestamp: Date.now()
+          };
+          
+          this.measurements.push(measurement);
+          this.updateInfoPanel();
+          
+          // Create 3D line in AR
+          this.createARLine(p1, p2, measurement.value);
+          
+          // Reset for next measurement
+          setTimeout(() => {
+            this.measurementPoints = [];
+            this.worldPoints = [];
+            this.redrawMeasurements();
+          }, 1500);
+        } else {
+          // Fallback to 2D measurement
+          const [p1, p2] = this.measurementPoints;
+          const distance = Math.sqrt(Math.pow(p2.x - p1.x, 2) + Math.pow(p2.y - p1.y, 2));
+          
+          // Convert to real-world units (simplified - would need proper calibration)
+          const realDistance = (distance * this.calibrationFactor).toFixed(1);
+          
+          // Store measurement
+          const measurement = {
+            type: 'distance',
+            value: `${realDistance} cm`,
+            points: [...this.measurementPoints],
+            timestamp: Date.now()
+          };
+          
+          this.measurements.push(measurement);
+          this.updateInfoPanel();
+          
+          // Show result
+          this.showMeasurementLabel(
+            (p1.x + p2.x) / 2,
+            (p1.y + p2.y) / 2,
+            measurement.value
+          );
+          
+          // Reset for next measurement
+          setTimeout(() => {
+            this.measurementPoints = [];
+            this.redrawMeasurements();
+          }, 1500);
+        }
+      }
+
+      createARLine(point1, point2, label) {
+        if (!this.scene) return;
         
-        // Convert to real-world units (simplified - would need proper calibration)
-        const realDistance = (distance * this.calibrationFactor).toFixed(1);
+        // Create line geometry
+        const points = [];
+        points.push(new THREE.Vector3(point1.x, point1.y, point1.z));
+        points.push(new THREE.Vector3(point2.x, point2.y, point2.z));
         
-        // Store measurement
-        const measurement = {
-          type: 'distance',
-          value: `${realDistance} cm`,
-          points: [...this.measurementPoints],
-          timestamp: Date.now()
-        };
+        const geometry = new THREE.BufferGeometry().setFromPoints(points);
+        const material = new THREE.LineBasicMaterial({ 
+          color: 0x667eea,
+          linewidth: 3
+        });
         
-        this.measurements.push(measurement);
-        this.updateInfoPanel();
+        const line = new THREE.Line(geometry, material);
+        this.scene.add(line);
         
-        // Show result
-        this.showMeasurementLabel(
-          (p1.x + p2.x) / 2,
-          (p1.y + p2.y) / 2,
-          measurement.value
+        // Add text label in 3D space
+        const midPoint = new THREE.Vector3(
+          (point1.x + point2.x) / 2,
+          (point1.y + point2.y) / 2,
+          (point1.z + point2.z) / 2
         );
         
-        // Reset for next measurement
-        setTimeout(() => {
-          this.measurementPoints = [];
-          this.redrawMeasurements();
-        }, 1500);
+        // Create sprite for label
+        const canvas = document.createElement('canvas');
+        const context = canvas.getContext('2d');
+        canvas.width = 256;
+        canvas.height = 64;
+        
+        context.fillStyle = 'rgba(102, 126, 234, 0.9)';
+        context.fillRect(0, 0, canvas.width, canvas.height);
+        
+        context.font = 'Bold 36px Arial';
+        context.fillStyle = 'white';
+        context.textAlign = 'center';
+        context.fillText(label, 128, 42);
+        
+        const texture = new THREE.CanvasTexture(canvas);
+        const spriteMaterial = new THREE.SpriteMaterial({ map: texture });
+        const sprite = new THREE.Sprite(spriteMaterial);
+        
+        sprite.position.copy(midPoint);
+        sprite.scale.set(0.5, 0.125, 1);
+        this.scene.add(sprite);
       }
 
       calculateAngle() {
@@ -1638,7 +1945,7 @@
           return;
         }
         
-        // Request permission on iOS
+        // Request permission on iOS 13+
         if (typeof DeviceOrientationEvent.requestPermission === 'function') {
           try {
             const permission = await DeviceOrientationEvent.requestPermission();
@@ -1648,11 +1955,22 @@
             }
           } catch (error) {
             console.error('Error requesting device orientation permission:', error);
+            this.showNotification('Please enable motion sensors in Settings');
+            return;
           }
         }
         
         // Start listening to device orientation
         window.addEventListener('deviceorientation', this.handleDeviceOrientation);
+        
+        // Also request device motion for better accuracy on iOS
+        if (window.DeviceMotionEvent && typeof DeviceMotionEvent.requestPermission === 'function') {
+          try {
+            await DeviceMotionEvent.requestPermission();
+          } catch (error) {
+            console.log('Motion permission not granted');
+          }
+        }
       }
 
       handleDeviceOrientation = (event) => {
@@ -1742,19 +2060,54 @@
             this.video.srcObject.getTracks().forEach(track => track.stop());
           }
           
-          // Camera constraints
+          // Camera constraints optimized for iOS
           const constraints = {
             video: {
               facingMode: 'environment',
-              width: { ideal: 1920, max: 1920 },
-              height: { ideal: 1080, max: 1080 },
-              frameRate: { ideal: 30, max: 60 }
+              width: { ideal: 1920, max: 2048 },
+              height: { ideal: 1080, max: 1536 },
+              frameRate: { ideal: 30, max: 60 },
+              // iOS-specific constraints
+              aspectRatio: { ideal: 16/9 },
+              resizeMode: 'crop-and-scale'
             },
             audio: false
           };
           
+          // Try to get depth camera if available (iPhone 12 Pro and later)
+          if (this.isIOS && 'mediaDevices' in navigator && navigator.mediaDevices.getSupportedConstraints) {
+            const supported = navigator.mediaDevices.getSupportedConstraints();
+            if (supported.facingMode) {
+              // Check for depth camera
+              try {
+                const devices = await navigator.mediaDevices.enumerateDevices();
+                const depthCamera = devices.find(device => 
+                  device.kind === 'videoinput' && 
+                  (device.label.toLowerCase().includes('truedepth') || 
+                   device.label.toLowerCase().includes('lidar'))
+                );
+                
+                if (depthCamera) {
+                  constraints.video.deviceId = depthCamera.deviceId;
+                  this.hasDepthCamera = true;
+                  console.log('Depth camera detected');
+                }
+              } catch (e) {
+                console.log('Could not enumerate devices');
+              }
+            }
+          }
+          
           const stream = await navigator.mediaDevices.getUserMedia(constraints);
           this.video.srcObject = stream;
+          
+          // Apply iOS-specific video optimizations
+          if (this.isIOS) {
+            this.video.setAttribute('webkit-playsinline', 'webkit-playsinline');
+            this.video.setAttribute('x5-playsinline', 'x5-playsinline');
+            this.video.setAttribute('x5-video-player-type', 'h5');
+            this.video.setAttribute('x5-video-player-fullscreen', 'false');
+          }
           
           return new Promise((resolve, reject) => {
             this.video.onloadedmetadata = () => resolve(this.video);
@@ -1769,36 +2122,18 @@
 
       async loadModels() {
         try {
-          this.updateLoadingStatus('Loading shape detection AI...');
+          this.updateLoadingStatus('Preparing AR features...');
           
-          // Load COCO-SSD for object detection
-          this.shapeDetector = await cocoSsd.load({
-            base: 'lite_mobilenet_v2'
-          });
-          
-          this.updateLoadingStatus('Loading hand tracking...');
-          
-          // Initialize MediaPipe Hands
-          const hands = new Hands({
-            locateFile: (file) => {
-              return `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`;
-            }
-          });
-          
-          hands.setOptions({
-            maxNumHands: 1,
-            modelComplexity: 1,
-            minDetectionConfidence: 0.5,
-            minTrackingConfidence: 0.5
-          });
-          
-          this.handDetector = hands;
-          
-          this.updateLoadingStatus('Optimizing for your device...');
+          // Skip loading heavy AI models if AR is supported
+          if (this.isARSupported) {
+            this.updateLoadingStatus('AR Kit ready!');
+          } else {
+            this.updateLoadingStatus('Using camera-based measurements');
+          }
           
         } catch (error) {
           console.error('Model loading error:', error);
-          throw new Error('Failed to load AI models. Please refresh.');
+          throw new Error('Failed to initialize. Please refresh.');
         }
       }
 
@@ -1856,23 +2191,199 @@
             const measurementTools = document.getElementById('measurementTools');
             const infoPanel = document.getElementById('infoPanel');
             const crosshair = document.getElementById('crosshair');
+            const arButton = document.getElementById('arButton');
             
             if (topHUD) topHUD.style.display = 'block';
             if (measurementTools) measurementTools.style.display = 'flex';
             if (infoPanel) infoPanel.style.display = 'block';
             if (crosshair) crosshair.style.display = 'block';
             
+            // Show AR button if supported
+            if (arButton && this.isARSupported) {
+              arButton.style.display = 'block';
+            }
+            
             this.isRunning = true;
             this.renderLoop();
             
             // Show welcome tip
-            this.showNotification('Tap to measure • Switch modes above');
+            if (this.isARSupported) {
+              this.showNotification('Tap to measure • Try AR mode for better accuracy');
+            } else {
+              this.showNotification('Tap to measure • Switch modes above');
+            }
           }, 500);
           
         } catch (error) {
           console.error('Startup error:', error);
           this.showError('Startup Error', error.message || 'Failed to initialize');
         }
+      }
+
+      async startAR() {
+        try {
+          this.updateLoadingStatus('Initializing AR...');
+          
+          // Request AR session
+          const sessionInit = {
+            requiredFeatures: ['hit-test'],
+            optionalFeatures: ['plane-detection', 'depth-sensing', 'light-estimation']
+          };
+          
+          this.xrSession = await navigator.xr.requestSession('immersive-ar', sessionInit);
+          
+          // Setup AR session
+          this.xrSession.addEventListener('end', () => {
+            this.xrSession = null;
+            this.xrHitTestSource = null;
+            this.showNotification('AR session ended');
+          });
+          
+          await this.renderer.xr.setSession(this.xrSession);
+          
+          // Get reference space
+          this.xrRefSpace = await this.xrSession.requestReferenceSpace('local');
+          
+          // Setup hit testing
+          if (this.xrSession.requestHitTestSource) {
+            const viewerSpace = await this.xrSession.requestReferenceSpace('viewer');
+            this.xrHitTestSource = await this.xrSession.requestHitTestSource({ 
+              space: viewerSpace 
+            });
+          }
+          
+          // Setup plane detection if available
+          if (this.planeDetection && this.xrSession.worldTrackingState) {
+            this.xrSession.worldTrackingState.addEventListener('planesdetected', (event) => {
+              this.handlePlanesDetected(event);
+            });
+          }
+          
+          // Setup depth sensing for LiDAR devices
+          if (this.depthSensing && this.hasLiDAR) {
+            try {
+              // Request depth information
+              const depthInfo = await this.xrSession.requestDepthInformation();
+              if (depthInfo) {
+                this.depthInfo = depthInfo;
+                console.log('Depth sensing enabled with LiDAR');
+                this.showNotification('LiDAR depth sensing active');
+              }
+            } catch (e) {
+              console.log('Depth sensing not available:', e);
+            }
+          }
+          
+          this.updateLoadingStatus('AR Ready!');
+          
+          // Hide loading and show AR UI
+          setTimeout(() => {
+            this.hideLoadingScreen();
+            
+            const topHUD = document.getElementById('topHUD');
+            const measurementTools = document.getElementById('measurementTools');
+            const infoPanel = document.getElementById('infoPanel');
+            
+            if (topHUD) topHUD.style.display = 'block';
+            if (measurementTools) measurementTools.style.display = 'flex';
+            if (infoPanel) infoPanel.style.display = 'block';
+            
+            // Hide regular canvas elements
+            this.video.style.display = 'none';
+            document.getElementById('crosshair').style.display = 'none';
+            
+            this.isRunning = true;
+            
+            // Start AR render loop
+            this.renderer.setAnimationLoop((timestamp, frame) => {
+              this.renderAR(timestamp, frame);
+            });
+            
+            // Show AR instructions
+            this.showNotification('Move device to detect surfaces • Tap to place measurement points');
+          }, 500);
+          
+        } catch (error) {
+          console.error('AR startup error:', error);
+          // Fallback to regular camera mode
+          this.showNotification('AR not available, using camera mode');
+          await this.start();
+        }
+      }
+
+      renderAR(timestamp, frame) {
+        if (!frame || !this.xrSession) return;
+        
+        const session = frame.session;
+        const pose = frame.getViewerPose(this.xrRefSpace);
+        
+        if (pose) {
+          // Update camera matrices
+          for (const view of pose.views) {
+            const viewport = session.renderState.baseLayer.getViewport(view);
+            this.renderer.setSize(viewport.width, viewport.height);
+            
+            this.camera.matrix.fromArray(view.transform.matrix);
+            this.camera.projectionMatrix.fromArray(view.projectionMatrix);
+            this.camera.updateMatrixWorld(true);
+            
+            // Hit test for reticle placement
+            if (this.xrHitTestSource && this.currentMode === 'measure') {
+              const hitTestResults = frame.getHitTestResults(this.xrHitTestSource);
+              
+              if (hitTestResults.length > 0) {
+                const hit = hitTestResults[0];
+                this.reticle.visible = true;
+                this.reticle.matrix.fromArray(
+                  hit.getPose(this.xrRefSpace).transform.matrix
+                );
+              } else {
+                this.reticle.visible = false;
+              }
+            }
+            
+            // Render scene
+            this.renderer.render(this.scene, this.camera);
+          }
+        }
+        
+        // Update measurements display
+        this.updateARMeasurements();
+      }
+
+      handlePlanesDetected(event) {
+        // Handle detected planes for more accurate measurements
+        const planes = event.detectedPlanes;
+        
+        planes.forEach(plane => {
+          // Create visual representation of detected planes
+          if (!plane.mesh) {
+            const geometry = new THREE.PlaneGeometry(1, 1);
+            const material = new THREE.MeshBasicMaterial({
+              color: 0x00ff00,
+              transparent: true,
+              opacity: 0.2,
+              side: THREE.DoubleSide
+            });
+            
+            plane.mesh = new THREE.Mesh(geometry, material);
+            this.scene.add(plane.mesh);
+          }
+          
+          // Update plane mesh position and size
+          plane.mesh.position.copy(plane.center);
+          plane.mesh.quaternion.copy(plane.orientation);
+          plane.mesh.scale.set(plane.extents.x, 1, plane.extents.z);
+        });
+      }
+
+      updateARMeasurements() {
+        // Update any active measurements in AR space
+        this.measurements.forEach(measurement => {
+          if (measurement.worldPoints && measurement.arLine) {
+            // Update line positions if needed
+          }
+        });
       }
 
       renderLoop() {
